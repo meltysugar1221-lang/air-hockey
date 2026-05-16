@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>エアホッケー 3D</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;overflow:hidden;background:#0a1a0a}
+body{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;font-family:'Segoe UI',system-ui,sans-serif}
+#ui-top{width:100%;max-width:480px;display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:rgba(0,0,0,0.5);flex-shrink:0;gap:6px}
+.hud-box{background:rgba(255,220,80,0.15);border:1.5px solid rgba(255,200,60,0.5);border-radius:8px;padding:3px 8px;text-align:center}
+.hud-label{font-size:10px;color:#ffd;letter-spacing:1px;font-weight:700}
+.hud-val{font-size:19px;font-weight:900;color:#fff;text-shadow:0 0 8px #fa0}
+#diff-row{display:flex;gap:4px}
+.db{padding:3px 9px;font-size:11px;font-weight:700;border-radius:16px;border:1.5px solid #ffd060;background:rgba(0,0,0,0.4);color:#ffd060;cursor:pointer;transition:.15s}
+.db.active{background:#ffd060;color:#222}
+#canvas-wrap{position:relative;width:100%;max-width:480px;flex:1;overflow:hidden}
+#gc{display:block;width:100%;height:100%;touch-action:none}
+#score-disp{position:absolute;top:8px;left:50%;transform:translateX(-50%);display:flex;gap:32px;pointer-events:none}
+.snum{font-size:48px;font-weight:900;color:#fff;text-shadow:0 0 18px #f80,0 3px 0 #840;line-height:1}
+.slabel{font-size:11px;text-align:center;color:#ffd;font-weight:700;margin-top:2px}
+#msg{position:absolute;top:40%;left:50%;transform:translate(-50%,-50%);font-size:26px;font-weight:900;color:#ffe;text-shadow:0 0 16px #fa0;background:rgba(0,0,0,0.6);padding:10px 26px;border-radius:18px;pointer-events:none;opacity:0;transition:opacity .25s;white-space:nowrap;z-index:20}
+#msg.show{opacity:1}
+#ui-bot{width:100%;max-width:480px;display:flex;justify-content:center;gap:12px;padding:6px;background:rgba(0,0,0,0.4);flex-shrink:0}
+.btn{padding:6px 20px;font-size:13px;font-weight:700;border-radius:18px;border:1.5px solid #ffd060;background:rgba(0,0,0,0.4);color:#ffd060;cursor:pointer}
+.btn:hover{background:#ffd060;color:#222}
+</style>
+</head>
+<body>
+<div id="ui-top">
+  <div class="hud-box"><div class="hud-label">タイム</div><div class="hud-val" id="h-time">00:00</div></div>
+  <div id="diff-row">
+    <button class="db" onclick="setDiff('easy')">やさしい</button>
+    <button class="db active" onclick="setDiff('normal')">ふつう</button>
+    <button class="db" onclick="setDiff('hard')">むずかしい</button>
+  </div>
+  <div class="hud-box"><div class="hud-label">勝敗</div><div class="hud-val" id="h-wr">0-0</div></div>
+</div>
+
+<div id="canvas-wrap">
+  <canvas id="gc"></canvas>
+  <div id="score-disp">
+    <div><div class="snum" id="sc">0</div><div class="slabel">CPU</div></div>
+    <div><div class="snum" id="sp">0</div><div class="slabel">あなた</div></div>
+  </div>
+  <div id="msg"></div>
+</div>
+
+<div id="ui-bot">
+  <button class="btn" onclick="resetGame()">リスタート</button>
+  <button class="btn" id="bgm-btn" onclick="toggleBgm()">🎵 BGM</button>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════
+// PERSPECTIVE PROJECTION
+// ═══════════════════════════════════════════════
+// Table lives in "game space": x∈[-1,1], z∈[-1,1]
+// y is vertical (height above table)
+// Camera is above and behind player's side
+
+const CAM = { x:0, y:1.55, z:1.85 }; // eye position
+const FOCAL = 1.1; // focal length
+
+let CW, CH; // canvas pixel dims
+
+function project(gx, gy, gz) {
+  // translate relative to camera
+  const dx = gx - CAM.x;
+  const dy = gy - CAM.y;
+  const dz = gz - CAM.z;
+  // simple perspective (looking toward -z, +y is up)
+  // flip dz so we look "into" the table
+  const pz = -dz; // depth (positive = in front)
+  if (pz <= 0.01) return null;
+  const px = dx / pz * FOCAL;
+  const py = -dy / pz * FOCAL; // flip y for screen
+  // map to canvas (center = CW/2, CH*0.46)
+  const sx = CW * 0.5 + px * CW * 0.5;
+  const sy = CH * 0.46 + py * CW * 0.5;
+  const scale = FOCAL / pz; // for sizing objects
+  return { sx, sy, scale, depth: pz };
+}
+
+// ═══════════════════════════════════════════════
+// CANVAS
+// ═══════════════════════════════════════════════
+const canvas = document.getElementById('gc');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const wrap = document.getElementById('canvas-wrap');
+  CW = wrap.clientWidth;
+  CH = wrap.clientHeight;
+  canvas.width = CW;
+  canvas.height = CH;
+}
+
+// ═══════════════════════════════════════════════
+// AUDIO
+// ═══════════════════════════════════════════════
+let audioCtx = null, bgmOn = false, bgmTimers = [];
+function ac() {
+  if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+function beep(freq, type='sine', dur=0.07, vol=0.2, detune=0) {
+  try {
+    const a = ac(), o = a.createOscillator(), g = a.createGain();
+    o.connect(g); g.connect(a.destination);
+    o.type = type; o.frequency.value = freq; o.detune.value = detune;
+    o.frequency.exponentialRampToValueAtTime(freq*0.6, a.currentTime+dur);
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur);
+    o.start(); o.stop(a.currentTime+dur+0.01);
+  } catch(e){}
+}
+function playGoal(win) {
+  const fs = win ? [523,659,784,1047] : [330,294,262,220];
+  fs.forEach((f,i) => setTimeout(()=>beep(f,'square',0.15,0.18), i*130));
+}
+function startBgm() {
+  if (bgmOn) return; bgmOn = true;
+  const mel = [523,587,659,784,659,587,523,494,523,0,659,784,880,784,0,523];
+  let i = 0;
+  function tick() {
+    if (!bgmOn) return;
+    const f = mel[i%mel.length];
+    if (f) beep(f,'triangle',0.17,0.07);
+    i++;
+    bgmTimers.push(setTimeout(tick, 230));
+  }
+  tick();
+}
+function stopBgm() { bgmOn=false; bgmTimers.forEach(clearTimeout); bgmTimers=[]; }
+function toggleBgm() {
+  bgmOn ? stopBgm() : startBgm();
+  document.getElementById('bgm-btn').textContent = bgmOn ? '🔇 BGM' : '🎵 BGM';
+}
+
+// ═══════════════════════════════════════════════
+// GAME STATE  (game coords: x∈[-1,1], z∈[-1,1])
+// ═══════════════════════════════════════════════
+const TBL = { x1:-1, x2:1, z1:-1, z2:1 }; // table bounds
+const GOAL_HALF = 0.32; // half-width of goal
+
+let diff = 'normal';
+let scoreP = 0, scoreCpu = 0, wins = 0, losses = 0;
+let puck, playerPaddle, cpuPaddle;
+let serving = true, servTimer = 0;
+let matchSec = 0, ticker = 0;
+let bearEmo = 'normal', bearFrame = 0;
+
+// puck radius in game units
+const PUCK_GR = 0.065;
+const PADDLE_GR = 0.1;
+
+function cpuSpd() { return diff==='easy'?0.018: diff==='normal'?0.030: 0.050; }
+function baseSpeed() { return diff==='easy'?0.030: diff==='normal'?0.048: 0.068; }
+
+function initGame() {
+  puck = { x:0, z:0.3, vx:0, vz:0 };
+  playerPaddle = { x:0, z:0.75, tx:0, tz:0.75 };
+  cpuPaddle = { x:0, z:-0.75 };
+  serving = true; servTimer = 70;
+  matchSec = 0; ticker = 0;
+}
+function resetGame() {
+  scoreP=0; scoreCpu=0;
+  document.getElementById('sc').textContent='0';
+  document.getElementById('sp').textContent='0';
+  wins=0; losses=0;
+  updateHUD();
+  if (animId) cancelAnimationFrame(animId);
+  initGame(); loop();
+}
+function setDiff(d) {
+  diff=d;
+  document.querySelectorAll('.db').forEach((b,i)=>{
+    b.classList.toggle('active', ['easy','normal','hard'][i]===d);
+  });
+  resetGame();
+}
+
+function servePuck(toPlayer) {
+  const ang = (Math.random()*50-25)*Math.PI/180;
+  const sp = baseSpeed();
+  puck.x=0; puck.z=0;
+  puck.vx = Math.sin(ang)*sp;
+  puck.vz = toPlayer ? sp : -sp;
+  serving=false;
+}
+
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+
+function resolveCircles() {
+  const dx=puck.x-playerPaddle.x, dz=puck.z-playerPaddle.z;
+  const dist=Math.hypot(dx,dz), minD=PUCK_GR+PADDLE_GR;
+  if(dist<minD && dist>0.001){
+    const nx=dx/dist, nz=dz/dist;
+    const sep=minD-dist;
+    puck.x+=nx*sep; puck.z+=nz*sep;
+    playerPaddle.x-=nx*sep*0.15; playerPaddle.z-=nz*sep*0.15;
+    const dot=puck.vx*nx+puck.vz*nz;
+    puck.vx-=2*dot*nx; puck.vz-=2*dot*nz;
+    // add player velocity to puck
+    const pvx=(playerPaddle.tx-playerPaddle.x)*0.6;
+    const pvz=(playerPaddle.tz-playerPaddle.z)*0.6;
+    puck.vx+=pvx*0.7; puck.vz+=pvz*0.7;
+    const sp=Math.hypot(puck.vx,puck.vz);
+    const maxSp=baseSpeed()*2.2;
+    if(sp>maxSp){puck.vx=puck.vx/sp*maxSp; puck.vz=puck.vz/sp*maxSp;}
+    if(sp<baseSpeed()*0.5 && sp>0.001){puck.vx=puck.vx/sp*baseSpeed()*0.5; puck.vz=puck.vz/sp*baseSpeed()*0.5;}
+    beep(280+Math.random()*120,'sine',0.07,0.22);
+  }
+  const dx2=puck.x-cpuPaddle.x, dz2=puck.z-cpuPaddle.z;
+  const dist2=Math.hypot(dx2,dz2), minD2=PUCK_GR+PADDLE_GR;
+  if(dist2<minD2 && dist2>0.001){
+    const nx=dx2/dist2, nz=dz2/dist2;
+    const sep=minD2-dist2;
+    puck.x+=nx*sep; puck.z+=nz*sep;
+    const dot=puck.vx*nx+puck.vz*nz;
+    puck.vx-=2*dot*nx; puck.vz-=2*dot*nz;
+    const sp=Math.hypot(puck.vx,puck.vz);
+    const maxSp=baseSpeed()*2.0;
+    if(sp>maxSp){puck.vx=puck.vx/sp*maxSp; puck.vz=puck.vz/sp*maxSp;}
+    if(sp<baseSpeed()*0.5 && sp>0.001){puck.vx=puck.vx/sp*baseSpeed()*0.5; puck.vz=puck.vz/sp*baseSpeed()*0.5;}
+    beep(220+Math.random()*100,'sine',0.07,0.2);
+  }
+}
+
+let animId;
+function update() {
+  ticker++;
+  bearFrame++;
+  if(ticker%60===0){matchSec++; updateHUD();}
+
+  if(serving){servTimer--; if(servTimer<=0) servePuck(true); return;}
+
+  // Move puck
+  puck.x+=puck.vx; puck.z+=puck.vz;
+
+  // Wall bounces
+  if(puck.x-PUCK_GR < TBL.x1){puck.x=TBL.x1+PUCK_GR; puck.vx*=-0.92; beep(180,'square',0.05,0.15);}
+  if(puck.x+PUCK_GR > TBL.x2){puck.x=TBL.x2-PUCK_GR; puck.vx*=-0.92; beep(180,'square',0.05,0.15);}
+
+  // CPU goal (z < -1)
+  if(puck.z-PUCK_GR < TBL.z1){
+    if(Math.abs(puck.x) < GOAL_HALF){
+      scoreP++;
+      document.getElementById('sp').textContent=scoreP;
+      bearEmo='angry'; setTimeout(()=>bearEmo='normal',2000);
+      playGoal(true);
+      if(scoreP>=7){showMsg('🎉 あなたの勝ち！',2000); wins++; updateHUD(); setTimeout(()=>{initGame();},2200);}
+      else{showMsg('ゴール！🎯',900); initGame(); setTimeout(()=>servePuck(false),950);}
+      return;
+    } else {puck.z=TBL.z1+PUCK_GR; puck.vz*=-0.88; beep(160,'square',0.06,0.15);}
+  }
+
+  // Player goal (z > 1)
+  if(puck.z+PUCK_GR > TBL.z2){
+    if(Math.abs(puck.x) < GOAL_HALF){
+      scoreCpu++;
+      document.getElementById('sc').textContent=scoreCpu;
+      bearEmo='happy'; setTimeout(()=>bearEmo='normal',1500);
+      playGoal(false);
+      if(scoreCpu>=7){showMsg('😢 CPUの勝ち...',2000); losses++; updateHUD(); setTimeout(()=>{initGame();},2200);}
+      else{showMsg('失点... 😰',900); initGame(); setTimeout(()=>servePuck(true),950);}
+      return;
+    } else {puck.z=TBL.z2-PUCK_GR; puck.vz*=-0.88; beep(160,'square',0.06,0.15);}
+  }
+
+  // CPU AI
+  const cspd=cpuSpd();
+  let tgx=0, tgz=-0.75;
+  if(puck.vz<0){ // puck coming at CPU
+    const t=(tgz-puck.z)/(puck.vz||0.001);
+    tgx=puck.x+puck.vx*t;
+    if(diff==='easy') tgx+=(Math.random()-0.5)*0.35;
+    else if(diff==='normal') tgx+=(Math.random()-0.5)*0.12;
+    tgx=clamp(tgx,-0.85,0.85);
+  }
+  const cdx=tgx-cpuPaddle.x, cdz=tgz-cpuPaddle.z;
+  const cd=Math.hypot(cdx,cdz);
+  if(cd>cspd){cpuPaddle.x+=cdx/cd*cspd; cpuPaddle.z+=cdz/cd*cspd;}
+  cpuPaddle.x=clamp(cpuPaddle.x,TBL.x1+PADDLE_GR,TBL.x2-PADDLE_GR);
+  cpuPaddle.z=clamp(cpuPaddle.z,TBL.z1+PADDLE_GR,0-PADDLE_GR);
+
+  // Player paddle smooth lerp
+  const pmx=playerPaddle.tx-playerPaddle.x, pmz=playerPaddle.tz-playerPaddle.z;
+  const pmd=Math.hypot(pmx,pmz);
+  if(pmd>0.001){const mm=Math.min(pmd,0.09); playerPaddle.x+=pmx/pmd*mm; playerPaddle.z+=pmz/pmd*mm;}
+  playerPaddle.x=clamp(playerPaddle.x,TBL.x1+PADDLE_GR,TBL.x2-PADDLE_GR);
+  playerPaddle.z=clamp(playerPaddle.z,0+PADDLE_GR,TBL.z2-PADDLE_GR);
+
+  resolveCircles();
+  puck.vx*=0.999; puck.vz*=0.999;
+}
+
+function updateHUD(){
+  const mm=String(Math.floor(matchSec/60)).padStart(2,'0');
+  const ss=String(matchSec%60).padStart(2,'0');
+  document.getElementById('h-time').textContent=mm+':'+ss;
+  document.getElementById('h-wr').textContent=wins+'-'+losses;
+}
+function showMsg(txt,dur=1000){
+  const el=document.getElementById('msg');
+  el.textContent=txt; el.classList.add('show');
+  setTimeout(()=>el.classList.remove('show'),dur);
+}
+
+// ═══════════════════════════════════════════════
+// DRAWING
+// ═══════════════════════════════════════════════
+
+// Draw background: forest + sky
+function drawBG() {
+  // Sky
+  const sky=ctx.createLinearGradient(0,0,0,CH*0.55);
+  sky.addColorStop(0,'#1a3a6a'); sky.addColorStop(0.6,'#3a7a30'); sky.addColorStop(1,'#1a4a10');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,CW,CH);
+
+  // Trees silhouette
+  for(let i=0;i<14;i++){
+    const tx=CW*(i/13.0);
+    const th=CH*(0.18+Math.sin(i*1.7)*0.06);
+    const ty=CH*0.5-th;
+    ctx.fillStyle=`hsl(${120+i*5},40%,${12+i%3*4}%)`;
+    ctx.beginPath();
+    ctx.moveTo(tx-CW*0.04,ty+th); ctx.lineTo(tx,ty); ctx.lineTo(tx+CW*0.04,ty+th);
+    ctx.fill();
+    ctx.fillStyle=`hsl(${115+i*4},38%,${10+i%2*4}%)`;
+    ctx.beginPath();
+    ctx.moveTo(tx-CW*0.032,ty+th*0.65); ctx.lineTo(tx,ty-th*0.12); ctx.lineTo(tx+CW*0.032,ty+th*0.65);
+    ctx.fill();
+  }
+}
+
+// Project table corners for clipping / quad drawing
+function drawTable3D() {
+  // Table surface: 4 corners in game space
+  const corners = [
+    project(-1,0,-1), project(1,0,-1),
+    project(1,0,1),   project(-1,0,1)
+  ];
+  if(corners.some(c=>!c)) return;
+
+  // Main surface
+  ctx.beginPath();
+  ctx.moveTo(corners[0].sx,corners[0].sy);
+  ctx.lineTo(corners[1].sx,corners[1].sy);
+  ctx.lineTo(corners[2].sx,corners[2].sy);
+  ctx.lineTo(corners[3].sx,corners[3].sy);
+  ctx.closePath();
+  const tg=ctx.createLinearGradient(0,corners[0].sy,0,corners[2].sy);
+  tg.addColorStop(0,'#f0c428'); tg.addColorStop(0.5,'#f8da3a'); tg.addColorStop(1,'#c89a1a');
+  ctx.fillStyle=tg; ctx.fill();
+
+  // Table rim (raised edge) — draw 4 sides as quads
+  const rimH = 0.06; // rim height in game units
+  drawRimSide([-1,0,-1],[1,0,-1],[-1,rimH,-1],[1,rimH,-1],'#8a6010');
+  drawRimSide([-1,0,1],[1,0,1],[-1,rimH,1],[1,rimH,1],'#7a5008','#a07828');
+  drawRimSide([-1,0,-1],[-1,0,1],[-1,rimH,-1],[-1,rimH,1],'#906215');
+  drawRimSide([1,0,-1],[1,0,1],[1,rimH,-1],[1,rimH,1],'#906215');
+
+  // Center line
+  drawLine3D(-1,0.002,0, 1,0.002,0, 'rgba(255,255,255,0.5)', 3);
+
+  // Center circle
+  drawCircle3D(0,0.002,0, 0.22, 'rgba(255,255,255,0.4)', 2.5);
+
+  // Goal areas
+  drawGoalArea(-GOAL_HALF, -1, GOAL_HALF, -0.85, 'rgba(220,60,40,0.35)', '#e83030');
+  drawGoalArea(-GOAL_HALF,  0.85, GOAL_HALF, 1, 'rgba(40,80,210,0.35)', '#3060e0');
+}
+
+function drawRimSide(a,b,c,d, col, col2) {
+  const pa=project(a[0],a[1],a[2]), pb=project(b[0],b[1],b[2]);
+  const pc=project(c[0],c[1],c[2]), pd=project(d[0],d[1],d[2]);
+  if(!pa||!pb||!pc||!pd) return;
+  ctx.beginPath();
+  ctx.moveTo(pa.sx,pa.sy); ctx.lineTo(pb.sx,pb.sy);
+  ctx.lineTo(pd.sx,pd.sy); ctx.lineTo(pc.sx,pc.sy);
+  ctx.closePath();
+  if(col2){
+    const rg=ctx.createLinearGradient(pc.sx,pc.sy,pa.sx,pa.sy);
+    rg.addColorStop(0,col); rg.addColorStop(1,col2||col);
+    ctx.fillStyle=rg;
+  } else { ctx.fillStyle=col; }
+  ctx.fill();
+}
+
+function drawLine3D(x1,y1,z1, x2,y2,z2, col, lw) {
+  const a=project(x1,y1,z1), b=project(x2,y2,z2);
+  if(!a||!b) return;
+  ctx.strokeStyle=col; ctx.lineWidth=lw;
+  ctx.setLineDash([8,6]);
+  ctx.beginPath(); ctx.moveTo(a.sx,a.sy); ctx.lineTo(b.sx,b.sy); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawCircle3D(cx,cy,cz, r, col, lw) {
+  // approximate circle as polygon projected
+  ctx.strokeStyle=col; ctx.lineWidth=lw;
+  ctx.beginPath();
+  for(let i=0;i<=32;i++){
+    const a=i/32*Math.PI*2;
+    const p=project(cx+Math.cos(a)*r, cy, cz+Math.sin(a)*r);
+    if(!p) continue;
+    i===0 ? ctx.moveTo(p.sx,p.sy) : ctx.lineTo(p.sx,p.sy);
+  }
+  ctx.stroke();
+}
+
+function drawGoalArea(x1,z1,x2,z2, fill, stroke) {
+  const corners=[project(x1,0.002,z1),project(x2,0.002,z1),project(x2,0.002,z2),project(x1,0.002,z2)];
+  if(corners.some(c=>!c)) return;
+  ctx.beginPath();
+  ctx.moveTo(corners[0].sx,corners[0].sy);
+  corners.forEach(c=>ctx.lineTo(c.sx,c.sy));
+  ctx.closePath();
+  ctx.fillStyle=fill; ctx.fill();
+  ctx.strokeStyle=stroke; ctx.lineWidth=2.5; ctx.stroke();
+}
+
+// Draw puck with perspective
+function drawPuck3D() {
+  const p=project(puck.x, 0, puck.z);
+  if(!p) return;
+  const r=p.scale*CW*0.042;
+  // Shadow
+  ctx.beginPath(); ctx.ellipse(p.sx+r*0.15, p.sy+r*0.3, r*1.1, r*0.35, 0, 0, Math.PI*2);
+  ctx.fillStyle='rgba(0,0,0,0.3)'; ctx.fill();
+  // Puck
+  const g=ctx.createRadialGradient(p.sx-r*0.28,p.sy-r*0.28,r*0.05,p.sx,p.sy,r);
+  g.addColorStop(0,'#bbb'); g.addColorStop(0.5,'#777'); g.addColorStop(1,'#222');
+  ctx.beginPath(); ctx.arc(p.sx,p.sy,r,0,Math.PI*2);
+  ctx.fillStyle=g; ctx.fill();
+  // Shine
+  ctx.beginPath(); ctx.ellipse(p.sx-r*0.25,p.sy-r*0.28,r*0.22,r*0.15,Math.PI*0.3,0,Math.PI*2);
+  ctx.fillStyle='rgba(255,255,255,0.55)'; ctx.fill();
+}
+
+// Draw CPU paddle (bear) with perspective
+function drawCpuPaddle3D() {
+  const p=project(cpuPaddle.x, 0, cpuPaddle.z);
+  if(!p) return;
+  const r=p.scale*CW*0.065;
+  // Shadow
+  ctx.beginPath(); ctx.ellipse(p.sx,p.sy+r*0.4,r*1.2,r*0.35,0,0,Math.PI*2);
+  ctx.fillStyle='rgba(0,0,0,0.25)'; ctx.fill();
+  // Red paddle
+  const g=ctx.createRadialGradient(p.sx-r*0.2,p.sy-r*0.2,r*0.05,p.sx,p.sy,r);
+  g.addColorStop(0,'#ff6050'); g.addColorStop(0.65,'#cc1810'); g.addColorStop(1,'#780808');
+  ctx.beginPath(); ctx.arc(p.sx,p.sy,r,0,Math.PI*2);
+  ctx.fillStyle=g; ctx.fill();
+  ctx.beginPath(); ctx.arc(p.sx,p.sy,r*0.52,0,Math.PI*2);
+  ctx.fillStyle='#ff8070'; ctx.fill();
+  ctx.beginPath(); ctx.arc(p.sx,p.sy,r*0.18,0,Math.PI*2);
+  ctx.fillStyle='#ffe0d8'; ctx.fill();
+  // Shine
+  ctx.beginPath(); ctx.ellipse(p.sx-r*0.22,p.sy-r*0.25,r*0.18,r*0.12,Math.PI*0.3,0,Math.PI*2);
+  ctx.fillStyle='rgba(255,255,255,0.4)'; ctx.fill();
+}
+
+// ─────────────── BEAR CHARACTER ───────────────
+function drawBearCharacter() {
+  // Project bear's position (above the CPU paddle, toward CPU side)
+  const bearZ = -1.08;
+  const bearPos = project(cpuPaddle.x*0.4, 0.45, bearZ);
+  if(!bearPos) return;
+
+  const sc = bearPos.scale * CW * 0.28;
+  const bx = bearPos.sx;
+  const by = bearPos.sy;
+  const bob = Math.sin(bearFrame*0.08)*sc*0.03;
+  const emo = bearEmo;
+
+  ctx.save();
+  ctx.translate(bx, by + bob);
+
+  // Body
+  ctx.beginPath(); ctx.ellipse(0, sc*0.12, sc*0.38, sc*0.32, 0, 0, Math.PI*2);
+  ctx.fillStyle='#8B5E3C'; ctx.fill();
+  // Belly
+  ctx.beginPath(); ctx.ellipse(0, sc*0.22, sc*0.28, sc*0.22, 0, 0, Math.PI*2);
+  ctx.fillStyle='#C4956A'; ctx.fill();
+
+  // Ears
+  [-1,1].forEach(s=>{
+    ctx.beginPath(); ctx.ellipse(s*sc*0.34,-sc*0.3,sc*0.13,sc*0.13,0,0,Math.PI*2);
+    ctx.fillStyle='#8B5E3C'; ctx.fill();
+    ctx.beginPath(); ctx.ellipse(s*sc*0.34,-sc*0.3,sc*0.075,sc*0.075,0,0,Math.PI*2);
+    ctx.fillStyle='#C4956A'; ctx.fill();
+  });
+
+  // Head
+  ctx.beginPath(); ctx.ellipse(0,-sc*0.18,sc*0.32,sc*0.29,0,0,Math.PI*2);
+  ctx.fillStyle='#8B5E3C'; ctx.fill();
+
+  // Double chin!
+  ctx.beginPath(); ctx.ellipse(0,sc*0.13,sc*0.24,sc*0.14,0,0,Math.PI*2);
+  ctx.fillStyle='#A0724A'; ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0,sc*0.21,sc*0.19,sc*0.09,0,0,Math.PI*2);
+  ctx.fillStyle='#C4956A'; ctx.fill();
+
+  // Muzzle
+  ctx.beginPath(); ctx.ellipse(0,-sc*0.08,sc*0.16,sc*0.12,0,0,Math.PI*2);
+  ctx.fillStyle='#C4956A'; ctx.fill();
+
+  // Nose
+  ctx.beginPath(); ctx.ellipse(0,-sc*0.16,sc*0.07,sc*0.05,0,0,Math.PI*2);
+  ctx.fillStyle='#2a1000'; ctx.fill();
+
+  // Eyes
+  const eyY=-sc*0.27;
+  if(emo==='happy'){
+    [-1,1].forEach(s=>{
+      ctx.beginPath(); ctx.arc(s*sc*0.14,eyY,sc*0.07,Math.PI,0);
+      ctx.strokeStyle='#2a1000'; ctx.lineWidth=sc*0.028; ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(s*sc*0.2,eyY+sc*0.06,sc*0.07,sc*0.04,0,0,Math.PI*2);
+      ctx.fillStyle='rgba(255,90,90,0.45)'; ctx.fill();
+    });
+  } else if(emo==='angry'){
+    [-1,1].forEach(s=>{
+      ctx.beginPath(); ctx.ellipse(s*sc*0.14,eyY,sc*0.08,sc*0.07,0,0,Math.PI*2);
+      ctx.fillStyle='#2a1000'; ctx.fill();
+      ctx.beginPath(); ctx.ellipse(s*sc*0.115,eyY-sc*0.025,sc*0.03,sc*0.025,0,0,Math.PI*2);
+      ctx.fillStyle='#fff'; ctx.fill();
+      ctx.beginPath(); ctx.moveTo(s*sc*0.05,eyY-sc*0.1); ctx.lineTo(s*sc*0.22,eyY-sc*0.06);
+      ctx.strokeStyle='#2a1000'; ctx.lineWidth=sc*0.03; ctx.stroke();
+    });
+  } else {
+    [-1,1].forEach(s=>{
+      ctx.beginPath(); ctx.ellipse(s*sc*0.14,eyY,sc*0.08,sc*0.082,0,0,Math.PI*2);
+      ctx.fillStyle='#2a1000'; ctx.fill();
+      ctx.beginPath(); ctx.ellipse(s*sc*0.115,eyY-sc*0.025,sc*0.03,sc*0.03,0,0,Math.PI*2);
+      ctx.fillStyle='#fff'; ctx.fill();
+    });
+  }
+
+  // Mouth
+  ctx.beginPath();
+  if(emo==='happy'){
+    ctx.arc(0,-sc*0.04,sc*0.08,0.1,Math.PI-0.1);
+    ctx.strokeStyle='#2a1000'; ctx.lineWidth=sc*0.025; ctx.stroke();
+  } else if(emo==='angry'){
+    ctx.arc(0,-sc*0.01,sc*0.07,Math.PI+0.2,-0.2);
+    ctx.strokeStyle='#2a1000'; ctx.lineWidth=sc*0.025; ctx.stroke();
+  } else {
+    ctx.arc(0,-sc*0.04,sc*0.06,0.1,Math.PI-0.1);
+    ctx.strokeStyle='#2a1000'; ctx.lineWidth=sc*0.022; ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+// ─────────────── PLAYER HAND (glove) ───────────────
+function drawPlayerHand() {
+  // Position hand attached to player paddle
+  const p=project(playerPaddle.x, 0.04, playerPaddle.z);
+  if(!p) return;
+
+  const sc=p.scale*CW*0.18;
+  const hx=p.sx, hy=p.sy;
+
+  // Movement wobble
+  const wobble=Math.sin(bearFrame*0.12)*sc*0.015;
+
+  ctx.save();
+  ctx.translate(hx, hy+wobble);
+
+  // Wrist / cuff
+  ctx.beginPath();
+  ctx.rect(-sc*0.22, sc*0.22, sc*0.44, sc*0.2);
+  ctx.fillStyle='#cc2222'; ctx.fill();
+  // Cuff stripe
+  ctx.beginPath();
+  ctx.rect(-sc*0.22, sc*0.22, sc*0.44, sc*0.06);
+  ctx.fillStyle='#fff'; ctx.fill();
+
+  // Palm (main glove body)
+  ctx.beginPath();
+  ctx.ellipse(0, sc*0.06, sc*0.28, sc*0.24, 0, 0, Math.PI*2);
+  ctx.fillStyle='#dd3333'; ctx.fill();
+
+  // Thumb
+  ctx.save();
+  ctx.translate(sc*0.24, sc*0.04);
+  ctx.rotate(-0.55);
+  ctx.beginPath(); ctx.ellipse(0,0,sc*0.1,sc*0.155,0,0,Math.PI*2);
+  ctx.fillStyle='#cc2222'; ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0,-sc*0.04,sc*0.075,sc*0.1,0,0,Math.PI*2);
+  ctx.fillStyle='#dd3333'; ctx.fill();
+  // Thumb knuckle line
+  ctx.beginPath(); ctx.moveTo(-sc*0.04,sc*0.04); ctx.lineTo(sc*0.04,sc*0.04);
+  ctx.strokeStyle='#aa1a1a'; ctx.lineWidth=sc*0.025; ctx.stroke();
+  ctx.restore();
+
+  // Fingers (4 fingers together)
+  [-sc*0.145,-sc*0.048,sc*0.048,sc*0.145].forEach((fx,i)=>{
+    const fh=sc*(i===0||i===3?0.18:0.22);
+    ctx.beginPath();
+    ctx.ellipse(fx, -sc*0.16, sc*0.068, fh, 0, 0, Math.PI*2);
+    ctx.fillStyle='#dd3333'; ctx.fill();
+    // Knuckle crease
+    ctx.beginPath(); ctx.moveTo(fx-sc*0.04,-sc*0.06); ctx.lineTo(fx+sc*0.04,-sc*0.06);
+    ctx.strokeStyle='#aa1a1a'; ctx.lineWidth=sc*0.022; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(fx-sc*0.03,-sc*0.12); ctx.lineTo(fx+sc*0.03,-sc*0.12);
+    ctx.strokeStyle='#aa1a1a'; ctx.lineWidth=sc*0.018; ctx.stroke();
+  });
+
+  // Glove seam lines on back
+  ctx.beginPath(); ctx.moveTo(-sc*0.05,sc*0.0); ctx.lineTo(-sc*0.05,sc*0.18);
+  ctx.strokeStyle='rgba(0,0,0,0.2)'; ctx.lineWidth=sc*0.02; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(sc*0.05,sc*0.0); ctx.lineTo(sc*0.05,sc*0.18);
+  ctx.stroke();
+
+  // Highlight
+  ctx.beginPath(); ctx.ellipse(-sc*0.06,-sc*0.05,sc*0.1,sc*0.06,Math.PI*0.3,0,Math.PI*2);
+  ctx.fillStyle='rgba(255,255,255,0.22)'; ctx.fill();
+
+  // Paddle top visible below hand
+  const g=ctx.createRadialGradient(0,sc*0.38,sc*0.02,0,sc*0.38,sc*0.18);
+  g.addColorStop(0,'#5080ff'); g.addColorStop(1,'#1030aa');
+  ctx.beginPath(); ctx.arc(0,sc*0.38,sc*0.2,0,Math.PI*2);
+  ctx.fillStyle=g; ctx.fill();
+  ctx.beginPath(); ctx.arc(0,sc*0.38,sc*0.1,0,Math.PI*2);
+  ctx.fillStyle='#90b0ff'; ctx.fill();
+
+  ctx.restore();
+}
+
+// ─────────────── MAIN DRAW ───────────────
+function draw() {
+  ctx.clearRect(0,0,CW,CH);
+  drawBG();
+  drawTable3D();
+  drawPuck3D();
+  drawCpuPaddle3D();
+  drawBearCharacter();
+  drawPlayerHand();
+}
+
+function loop(){ update(); draw(); animId=requestAnimationFrame(loop); }
+
+// ═══════════════════════════════════════════════
+// INPUT
+// ═══════════════════════════════════════════════
+function screenToGame(ex, ey) {
+  // Inverse project: given screen x,y, find game x,z on y=0 plane
+  // From project: sx = CW*0.5 + (gx-CAM.x)/(-gz+CAM.z)*FOCAL*CW*0.5
+  // Solve for gx, gz (iterative on z)
+  const px=(ex-CW*0.5)/(CW*0.5*FOCAL); // normalized screen x
+  const py=(ey-CH*0.46)/(CW*0.5*FOCAL); // normalized screen y (inverted)
+  // Ray: dir = (px,py,1) from cam in view space
+  // On y=0 plane: CAM.y + py*t_depth = 0 in actual coords
+  // The projection maps: py_screen = -(gy-CAM.y)/pz where pz=-dz
+  // At y=0: gy=0, so py_screen = CAM.y/pz => pz = CAM.y / (-py) (py negative for ground)
+  if(py >= 0) return null; // above horizon
+  const pz = CAM.y / (-py);
+  const gz = CAM.z - pz; // dz=-pz => gz=CAM.z+dz
+  const gx = CAM.x + px*pz;
+  return {x:gx, z:gz};
+}
+
+function onMove(e){
+  e.preventDefault();
+  const rect=canvas.getBoundingClientRect();
+  const scaleX=CW/rect.width, scaleY=CH/rect.height;
+  let cx,cy;
+  if(e.touches){cx=(e.touches[0].clientX-rect.left)*scaleX; cy=(e.touches[0].clientY-rect.top)*scaleY;}
+  else{cx=(e.clientX-rect.left)*scaleX; cy=(e.clientY-rect.top)*scaleY;}
+  const g=screenToGame(cx,cy);
+  if(!g) return;
+  playerPaddle.tx=clamp(g.x, TBL.x1+PADDLE_GR, TBL.x2-PADDLE_GR);
+  playerPaddle.tz=clamp(g.z, 0+PADDLE_GR, TBL.z2-PADDLE_GR);
+  if(audioCtx&&audioCtx.state==='suspended') audioCtx.resume();
+}
+
+canvas.addEventListener('mousemove',onMove);
+canvas.addEventListener('touchmove',onMove,{passive:false});
+canvas.addEventListener('touchstart',onMove,{passive:false});
+canvas.addEventListener('click',()=>{if(audioCtx&&audioCtx.state==='suspended')audioCtx.resume();});
+
+window.addEventListener('resize',()=>{resize();});
+
+// ═══════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════
+resize();
+initGame();
+loop();
+</script>
+</body>
+</html>
